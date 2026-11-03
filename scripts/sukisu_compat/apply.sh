@@ -6,17 +6,20 @@
 #      security_add_hooks(hooks, count, "ksu") 注册 LSM 钩子，
 #      6.8+ 内核要求 (hooks, count, const struct lsm_id *)，
 #      android16-6.12 GKI 编译报 -Wincompatible-pointer-types（-Werror）；
-#   2) kernel/kpm/super_access.c 引用 netlink_kernel_cfg.cb_mutex，
-#      该成员在 Linux 6.11 被上游移除，KPM 开启时 6.11+ 内核编译失败。
-#   3) builtin 2026-10-05 同步官方 KernelSU 后 kernel_includes.h
-#      引用 arch.h，但该文件只在 main 分支存在，builtin 漏带，
-#      所有平台编译报 fatal error: 'arch.h' file not found；
-#   4) 同步同时引入两处编译错误：supercall/dispatch.c 引用未定义的
-#      EVENT_SERVICES（uapi 头缺常量），selinux/rules.c 在 5.10+ 分支
-#      重复声明 pol/old_pol。
-#   5) builtin 在 app 启动路径对管理器/授权应用 disable_seccomp()，
+#   2) builtin 在 app 启动路径对管理器/授权应用 disable_seccomp()，
 #      管理器首页 "Seccomp 状态" 显示"未启用"；改为对齐 main 分支/BakaSU
 #      的过滤模式（保留 seccomp 过滤器 + action cache 放行 reboot）。
+#
+# 已由上游修复、本仓库随之移除的适配（核对 builtin 5ef32ad / main 31255c4）：
+#   - arch.h 缺失：builtin 已自带 kernel/arch.h（与本仓库旧副本逐字节一致）
+#   - EVENT_SERVICES 缺失 / rules.c 重复声明：builtin 已随 UAPI 6 同步修复
+#   - pkg_observer 的 track_throne(TRACK_THRONE_FORCE_SYNCHRONOUS)：已改回 false
+#   - supercall.h 的 KSU_IOCTL_KPM 笔误 / KSU_IOCTL_MANAGER 缺声明：
+#     上游已把 KPM / MANAGER 等并入统一的 KSU_IOCTL_EXTENSION，旧常量不复存在
+#   - throne_tracker 的 crown_manager 裸 return / pkg 作用域：上游已修正
+#   - netlink_kernel_cfg.cb_mutex（Linux 6.11 移除）：上游已改为构建期探测
+#     目标 netlink.h 并定义 KSU_NETLINK_CFG_HAS_CB_MUTEX，super_access.c
+#     以 #ifdef 守卫该成员（main: kernel/Kbuild / builtin: kernel/Makefile）
 #
 # 修复均以内容检测守卫，上游自行修复后自动跳过，重复执行幂等。
 #
@@ -59,68 +62,6 @@ else
   echo "lsm_hook.c 不存在或无需 lsm_id 兼容补丁，跳过"
 fi
 
-SUPER_FILE="$KSU_DIR/kernel/kpm/super_access.c"
-if [ -f "$SUPER_FILE" ] && grep -q 'DEFINE_MEMBER(netlink_kernel_cfg, cb_mutex)' "$SUPER_FILE"; then
-  if grep -q 'KERNEL_VERSION(6, 11, 0)' "$SUPER_FILE"; then
-    echo "super_access.c 已包含 cb_mutex 版本守卫，跳过"
-  else
-    echo "应用 cb_mutex 兼容补丁 (6.11+ 移除 netlink_kernel_cfg.cb_mutex)..."
-    patch -p1 --forward -d "$KSU_DIR" < "$COMPAT_DIR/sukisu-cb-mutex-6.11.patch" \
-      || fail "cb_mutex 兼容补丁应用失败（SukiSU 上游代码可能已变化）"
-    grep -q 'KERNEL_VERSION(6, 11, 0)' "$SUPER_FILE" \
-      || fail "cb_mutex 兼容补丁应用后校验失败"
-    echo "super_access.c: 6.11+ 已跳过 cb_mutex 成员"
-  fi
-else
-  echo "super_access.c 不存在或无需 cb_mutex 兼容补丁，跳过"
-fi
-
-# builtin 分支 2026-10-05 同步官方 KernelSU（70fa0e092）后，
-# kernel/kernel_includes.h 引用 #include "arch.h"，但 arch.h 只存在于
-# main 分支（kernel/include/arch.h），builtin 漏带导致全部平台编译失败:
-#   fatal error: 'arch.h' file not found
-# 从本仓库分发 main 分支的 arch.h，检测到缺失时补齐；
-# 上游修复（builtin 自带 arch.h）后自动跳过，幂等。
-ARCH_REF="$KSU_DIR/kernel/include/arch.h"
-if [ -f "$KSU_DIR/kernel/kernel_includes.h" ] && grep -q '#include "arch.h"' "$KSU_DIR/kernel/kernel_includes.h"; then
-  if [ -f "$ARCH_REF" ]; then
-    echo "arch.h 已存在，跳过补齐"
-  else
-    echo "补齐缺失的 arch.h（builtin 同步官方 KernelSU 时遗漏）..."
-    cp "$COMPAT_DIR/arch.h" "$ARCH_REF" \
-      || fail "arch.h 补齐失败"
-    grep -q '__KSU_H_ARCH' "$ARCH_REF" \
-      || fail "arch.h 补齐后校验失败"
-    echo "arch.h: 已补齐 (提供 PT_REGS_* / __ksyscall 所需的架构寄存器宏)"
-  fi
-else
-  echo "kernel_includes.h 不存在或未引用 arch.h，跳过补齐"
-fi
-
-# builtin 分支 2026-10-05 同步官方 KernelSU 后遗留的两处编译错误
-# （全平台构建在 ksu.c 聚合编译阶段命中）：
-#   1) supercall/dispatch.c 引用 EVENT_SERVICES，
-#      但 builtin 的 uapi 头只定义了 EVENT 1/2/3，缺 EVENT_SERVICES = 4；
-#   2) selinux/rules.c 在 #if >= 5.10 块内重复声明 pol/old_pol
-#      （函数开头已声明），C89 风格重定义直接编译失败。
-# 以内容检测守卫：主头已含 EVENT_SERVICES 或重复声明已消失时自动跳过，幂等。
-DISP_FILE="$KSU_DIR/kernel/supercall/dispatch.c"
-RULES_FILE="$KSU_DIR/kernel/selinux/rules.c"
-if { [ -f "$DISP_FILE" ] && grep -q 'EVENT_SERVICES' "$DISP_FILE" && \
-     ! grep -q 'EVENT_SERVICES' "$KSU_DIR/kernel/include/uapi/supercall.h"; } || \
-   { [ -f "$RULES_FILE" ] && grep -q 'struct selinux_policy \*pol, \*old_pol = selinux_state.policy;' "$RULES_FILE"; }; then
-  echo "应用 builtin 同步遗留问题修复 (EVENT_SERVICES + rules.c 重复声明)..."
-  patch -p1 --forward -d "$KSU_DIR" < "$COMPAT_DIR/builtin-sync-fixes.patch" \
-    || fail "builtin 同步遗留修复应用失败（SukiSU 上游代码可能已变化）"
-  grep -q 'EVENT_SERVICES, 4' "$KSU_DIR/kernel/include/uapi/supercall.h" \
-    || fail "EVENT_SERVICES 补齐后校验失败"
-  ! grep -q 'struct selinux_policy \*pol, \*old_pol = selinux_state.policy;' "$RULES_FILE" \
-    || fail "rules.c 重复声明修复后校验失败"
-  echo "EVENT_SERVICES 已补齐; rules.c 重复声明已移除"
-else
-  echo "builtin 同步遗留问题不存在或已修复，跳过"
-fi
-
 # ---- Seccomp 过滤模式（builtin 分支）----
 # 背景：builtin 分支在 app 启动路径（zygote setresuid 钩子）对管理器与授权
 # 应用直接调用 disable_seccomp()，管理器进程自身的 seccomp 过滤器被清除，
@@ -128,7 +69,7 @@ fi
 # 保留过滤器（"过滤模式"），仅通过 seccomp action cache（GKI 5.10+ backport）
 # 放行 reboot。
 # 处理：改写 lsm_hook.c 的 6 处 disable_seccomp() 调用点为 cache-allow 形式，
-# 分发 infra/seccomp_cache.c/h 并在 ksu.c 聚合编译；>=5.10 保留过滤器，
+# 分发 infra/seccomp_cache.c/h 并在 ksu.c（上游重构后为 ksu_main.c）聚合编译；>=5.10 保留过滤器，
 # <5.10 维持 disable_seccomp() 原行为（action cache 不存在）。
 # 守卫：仅命中 builtin 的 handle_zygote_setresuid 时执行，main 分支自动跳过；
 # 上游自行修复后幂等跳过。
@@ -146,14 +87,53 @@ if [ -f "$LSM_FILE" ] && grep -q 'handle_zygote_setresuid' "$LSM_FILE"; then
       || fail "seccomp 过滤模式补丁应用失败（SukiSU builtin 上游代码可能已变化）"
     grep -q 'ksu_seccomp_allow_cache' "$LSM_FILE" \
       || fail "seccomp 过滤模式补丁应用后校验失败 (lsm_hook.c)"
-    grep -q '#include "infra/seccomp_cache.c"' "$KSU_DIR/kernel/ksu.c" \
-      || fail "seccomp 过滤模式补丁应用后校验失败 (ksu.c)"
+    # 聚合编译文件随上游重构更名（kernel/ksu.c -> kernel/ksu_main.c），按实际路径校验
+    KSU_AGG=""
+    for cand in kernel/ksu.c kernel/ksu_main.c; do
+      if [ -f "$KSU_DIR/$cand" ]; then
+        KSU_AGG="$KSU_DIR/$cand"
+        break
+      fi
+    done
+    if [ -z "$KSU_AGG" ] || ! grep -q '#include "infra/seccomp_cache.c"' "$KSU_AGG"; then
+      fail "seccomp 过滤模式补丁应用后校验失败 (聚合编译文件 ksu.c/ksu_main.c)"
+    fi
     grep -q '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)' "$KSU_DIR/kernel/infra/seccomp_cache.c" \
       || fail "seccomp_cache.c 版本守卫校验失败"
     echo "seccomp 过滤模式已启用：管理器首页 Seccomp 状态将显示\"过滤模式\""
   fi
 else
   echo "lsm_hook.c 无 builtin setresuid 路径（main 分支已内置过滤模式），跳过 seccomp 过滤模式补丁"
+fi
+
+# ---- clang fall-through annotation ----
+# builtin 的 policy/allowlist.c 使用注释形式 fall-through；bazel GKI
+# 构建开启 -Werror,-Wimplicit-fallthrough 时会直接报错。改用内核
+# fallthrough 宏（展开为 __attribute__((__fallthrough__))），上游修复后自动跳过。
+if grep -rqF '/* fall through */' "$KSU_DIR/kernel" 2>/dev/null; then
+  echo "修正 SukiSU 源码的注释式 fall-through（bazel -Werror 兼容）..."
+  python3 - "$KSU_DIR" <<'PYEOF'
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1]) / "kernel"
+for path in sorted(root.rglob("*.c")):
+    text = path.read_text(encoding="utf-8", errors="surrogateescape")
+    if "/* fall through */" not in text:
+        continue
+    path.write_text(
+        text.replace("/* fall through */", "fallthrough;"),
+        encoding="utf-8",
+        errors="surrogateescape",
+    )
+    print(f"  {path}")
+PYEOF
+  if grep -rqF '/* fall through */' "$KSU_DIR/kernel" 2>/dev/null; then
+    fail "fall-through 注解修正后仍有残留"
+  fi
+  echo "fall-through 注解修正完成"
+else
+  echo "SukiSU 源码无注释式 fall-through，跳过"
 fi
 
 echo "SukiSU API 兼容补丁处理完成"
